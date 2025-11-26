@@ -1,362 +1,200 @@
-# data/advanced_vuln_type_extractor.py
-import re
-import pandas as pd
-from pathlib import Path
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+processor_extractor_multi_fixed.py
+支持你的精确多样本格式：
 
+样本格式：
+(1) 以如下行开头：
+    1 000/119/416/arr/CWE78_OS_Command_Injection__char_file_execl_61a_0_dataBuffer[9999].final.ll
+(2) 以如下行结尾：
+    -------------------------
+
+每个样本单独输出为 CSV 行
+"""
+
+import os
+import re
+import csv
+import argparse
+
+# ===============================================================
+#  疏松但准确的漏洞类型提取器（支持多标签）
+# ===============================================================
 
 class Extractor:
     def __init__(self):
-        # 定义详细的漏洞类型模式
         self.vuln_patterns = {
-            # 格式字符串漏洞
-            'Uncontrolled_Format_String': [
-                r'Uncontrolled_Format_String',
-                r'Format_String_Vulnerability',
-                r'Uncontrolled.*Format.*String'
-            ],
-            'Format_String_Error': [
-                r'Format_String_Error',
-                r'Format_String_Bug'
-            ],
-
-            # 命令注入
             'OS_Command_Injection': [
-                r'OS_Command_Injection',
-                r'Command_Injection',
-                r'Shell_Injection'
+                r'OS[_\s\-]*Command[_\s\-]*Injection',
+                r'Command[_\s\-]*Injection',
             ],
-
-            # 缓冲区溢出
             'Buffer_Overflow': [
-                r'Buffer_Overflow',
-                r'BufferOverrun',
-                r'Buffer_Overrun'
+                r'Buffer[_\s\-]*Overflow', r'strcpy', r'ncat', r'memcpy'
             ],
-            'Stack_Based_Buffer_Overflow': [
-                r'Stack_Based_Buffer_Overflow',
-                r'Stack_Buffer_Overflow'
-            ],
-            'Heap_Based_Buffer_Overflow': [
-                r'Heap_Based_Buffer_Overflow',
-                r'Heap_Buffer_Overflow'
-            ],
-
-            # 整数溢出
-            'Integer_Overflow': [
-                r'Integer_Overflow',
-                r'IntegerOverFlow'
-            ],
-            'Integer_Underflow': [
-                r'Integer_Underflow',
-                r'IntegerUnderflow'
-            ],
-
-            # 内存相关
             'Use_After_Free': [
-                r'Use_After_Free',
-                r'UseAfterFree'
+                r'Use[_\s\-]*After[_\s\-]*Free'
             ],
-            'Double_Free': [
-                r'Double_Free',
-                r'DoubleFree'
-            ],
-            'Memory_Leak': [
-                r'Memory_Leak',
-                r'MemoryLeak'
-            ],
-
-            # 输入验证
-            'Improper_Input_Validation': [
-                r'Improper_Input_Validation',
-                r'Input_Validation_Error'
-            ],
-
-            # 路径遍历
-            'Path_Traversal': [
-                r'Path_Traversal',
-                r'Directory_Traversal'
-            ],
-
-            # 竞态条件
-            'Race_Condition': [
-                r'Race_Condition',
-                r'Time_of_Check_Time_of_Use'
+            'Integer_Overflow': [
+                r'Integer[_\s\-]*Overflow'
             ]
         }
 
-    def extract_detailed_vuln_types(self, file_path):
-        """从文件路径提取详细的漏洞类型"""
-        if not file_path:
-            return []
+        self.cwe_map = {
+            '78': 'OS_Command_Injection',
+            '119': 'Buffer_Overflow',
+            '416': 'Use_After_Free',
+            '190': 'Integer_Overflow'
+        }
 
-        found_types = []
-
-        # 提取所有匹配的漏洞类型
-        for vuln_type, patterns in self.vuln_patterns.items():
-            for pattern in patterns:
-                if re.search(pattern, file_path, re.IGNORECASE):
-                    found_types.append(vuln_type)
-                    break  # 避免重复添加同一类型
-
-        # 如果没找到具体类型，尝试提取CWE编号
-        if not found_types:
-            cwe_match = re.search(r'CWE[-_\s]*(\d+)', file_path, re.IGNORECASE)
-            if cwe_match:
-                found_types.append(f"CWE-{cwe_match.group(1)}")
-
-        return found_types if found_types else ["unknown"]
-
-    def extract_cwe_number(self, file_path):
-        """提取CWE编号"""
-        if not file_path:
-            return "unknown"
-
-        cwe_match = re.search(r'CWE[-_\s]*(\d+)', file_path, re.IGNORECASE)
-        if cwe_match:
-            return f"CWE-{cwe_match.group(1)}"
+    def extract_cwe(self, header_line):
+        """从样本头中提取 CWE 编号"""
+        m = re.search(r'CWE[_\-]?(\d+)', header_line)
+        if m:
+            return f"CWE-{m.group(1)}"
         return "unknown"
 
-    def extract_all_vuln_info(self, file_path, ir_code):
-        """提取所有漏洞信息"""
-        # 提取详细漏洞类型
-        detailed_types = self.extract_detailed_vuln_types(file_path)
+    def extract_path(self, header_line):
+        """样本头本身包含路径"""
+        parts = header_line.strip().split(None, 1)  # split only two parts
+        if len(parts) == 2:
+            return parts[1]
+        return header_line.strip()
 
-        # 提取CWE编号
-        cwe_number = self.extract_cwe_number(file_path)
+    def extract_vuln_types(self, header_line, ir_block):
+        """从样本头 + IR 同时挖掘漏洞类型"""
+        found = []
 
-        # 从IR代码推断额外信息
-        inferred_info = self._infer_from_ir(ir_code)
+        # 1) 从文件名（CWE + 描述）匹配
+        for vtype, patterns in self.vuln_patterns.items():
+            for p in patterns:
+                if re.search(p, header_line, re.IGNORECASE):
+                    found.append(vtype)
+                    break
 
-        return {
-            'detailed_vuln_types': detailed_types,
-            'primary_vuln_type': detailed_types[0] if detailed_types else "unknown",
-            'cwe_number': cwe_number,
-            'inferred_info': inferred_info
-        }
+        # 2) 从 CWE 映射
+        m = re.search(r'CWE[_\-]?(\d+)', header_line)
+        if m:
+            cwe_id = m.group(1)
+            if cwe_id in self.cwe_map:
+                found.append(self.cwe_map[cwe_id])
 
-    def _infer_from_ir(self, ir_code):
-        """从IR代码推断漏洞信息"""
-        inferred = {
-            'risk_functions': [],
-            'dangerous_patterns': [],
-            'memory_operations': []
-        }
+        # 3) 从 IR 内容匹配
+        for vtype, patterns in self.vuln_patterns.items():
+            for p in patterns:
+                if re.search(p, ir_block, re.IGNORECASE):
+                    found.append(vtype)
+                    break
 
-        # 识别风险函数
-        risk_functions = [
-            (r'call.*system', 'system_call'),
-            (r'call.*exec', 'exec_call'),
-            (r'call.*gets', 'unsafe_input'),
-            (r'call.*strcpy', 'unsafe_copy'),
-            (r'call.*sprintf', 'unsafe_format'),
-            (r'call.*printf.*%', 'format_string'),
-            (r'call.*free', 'memory_free'),
-            (r'call.*malloc', 'memory_alloc')
-        ]
+        # 去重
+        result = []
+        for x in found:
+            if x not in result:
+                result.append(x)
 
-        for pattern, func_type in risk_functions:
-            if re.search(pattern, ir_code):
-                inferred['risk_functions'].append(func_type)
+        return result if result else ["unknown"]
 
-        # 识别危险模式
-        dangerous_patterns = [
-            (r'add.*nsw', 'integer_overflow'),
-            (r'mul.*nsw', 'integer_overflow'),
-            (r'getelementptr.*\[.*\].*i64.*add', 'buffer_overflow'),
-            (r'store.*i8\*.*load.*i8\*', 'memory_corruption')
-        ]
+class SampleSplitter:
+    def __init__(self):
+        # 样本头格式，例如：
+        # 1 000/119/416/arr/CWE78_......
+        self.header_re = re.compile(
+            r'^\s*\d+\s+.+CWE[\-_]?\d+.*$', re.IGNORECASE
+        )
 
-        for pattern, pattern_type in dangerous_patterns:
-            if re.search(pattern, ir_code):
-                inferred['dangerous_patterns'].append(pattern_type)
+        self.end_re = re.compile(r'^\s*-{5,}\s*$')
 
-        # 识别内存操作
-        memory_ops = [
-            (r'alloca', 'stack_allocation'),
-            (r'call.*malloc', 'heap_allocation'),
-            (r'call.*free', 'memory_deallocation'),
-            (r'load', 'memory_read'),
-            (r'store', 'memory_write')
-        ]
+    def split(self, text):
+        """
+        返回列表：[ (header, llvm_text), ... ]
+        """
+        lines = text.splitlines()
+        samples = []
 
-        for pattern, op_type in memory_ops:
-            if re.search(pattern, ir_code):
-                inferred['memory_operations'].append(op_type)
+        current_header = None
+        buffer = []
 
-        return inferred
+        for ln in lines:
+            if self.header_re.match(ln):
+                # 若已有样本缓冲区，则先结束该样本
+                if current_header is not None and buffer:
+                    samples.append((current_header, "\n".join(buffer)))
+                    buffer = []
 
-
-# 改进的处理器
-class Processor:
-    def __init__(self, data_dir="data/iSeVCs_for_train_programs"):
-        self.data_dir = Path(data_dir)
-        self.output_dir = Path("data/processed_output")
-        self.output_dir.mkdir(exist_ok=True)
-        self.vuln_extractor = Extractor()
-
-    def parse_single_sample(self, sample_content, source_file=""):
-        """解析单个样本并提取详细漏洞信息"""
-        lines = sample_content.strip().split('\n')
-        if not lines:
-            return None
-
-        # 查找标签行
-        label_line = None
-        ir_start_idx = 0
-
-        for i, line in enumerate(lines):
-            line = line.strip()
-            # 匹配标签+文件路径格式
-            if re.match(r'^\d+\s+\S', line):
-                label_line = line
-                ir_start_idx = i + 1
-                break
-
-        if label_line:
-            # 解析标签和文件路径
-            parts = label_line.split(' ', 1)
-            label = int(parts[0])
-            file_path = parts[1] if len(parts) > 1 else ""
-        else:
-            # 没有找到标签行
-            label = 0  # 默认安全
-            file_path = ""
-            ir_start_idx = 0
-
-        # 提取IR代码
-        ir_lines = []
-        for line in lines[ir_start_idx:]:
-            line = line.strip()
-            # 跳过空行和分隔符
-            if line and not re.match(r'^\s*\[.*\]\s*$', line) and not line.startswith('----'):
-                ir_lines.append(line)
-
-        ir_code = '\n'.join(ir_lines)
-
-        # 提取详细的漏洞信息
-        vuln_info = self.vuln_extractor.extract_all_vuln_info(file_path, ir_code)
-
-        return {
-            'label': label,
-            'file_path': file_path,
-            'ir_code': ir_code,
-            'source_file': source_file,
-            # 详细漏洞信息
-            'detailed_vuln_types': '|'.join(vuln_info['detailed_vuln_types']),
-            'primary_vuln_type': vuln_info['primary_vuln_type'],
-            'cwe_number': vuln_info['cwe_number'],
-            'inferred_risk_functions': '|'.join(vuln_info['inferred_info']['risk_functions']),
-            'inferred_dangerous_patterns': '|'.join(vuln_info['inferred_info']['dangerous_patterns']),
-            'inferred_memory_operations': '|'.join(vuln_info['inferred_info']['memory_operations'])
-        }
-
-    def process_all_files(self):
-        """处理并合并所有文件"""
-        # 查找所有txt文件
-        txt_files = list(self.data_dir.glob("*.txt"))
-        print(f"找到 {len(txt_files)} 个txt文件")
-
-        all_data = []
-
-        for txt_file in txt_files:
-            print(f"处理文件: {txt_file.name}")
-
-            try:
-                with open(txt_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-
-                # 分割样本
-                samples = self._split_samples(content)
-
-                # 解析每个样本
-                for sample in samples:
-                    if sample.strip():
-                        try:
-                            parsed_data = self.parse_single_sample(sample, txt_file.name)
-                            if parsed_data and parsed_data['ir_code'].strip():
-                                all_data.append(parsed_data)
-                        except Exception as e:
-                            print(f"  解析样本失败: {e}")
-                            continue
-
-                print(f"  从 {txt_file.name} 解析了 {len([s for s in samples if s.strip()])} 个样本")
-
-            except Exception as e:
-                print(f"处理文件 {txt_file} 失败: {e}")
+                current_header = ln.strip()
                 continue
 
-        print(f"\n总共解析了 {len(all_data)} 个样本")
+            # 样本结束线
+            if self.end_re.match(ln):
+                if current_header is not None:
+                    samples.append((current_header, "\n".join(buffer)))
+                    current_header = None
+                    buffer = []
+                continue
 
-        # 保存数据
-        if all_data:
-            self._save_and_analyze(all_data)
+            # 累积样本内容
+            if current_header is not None:
+                buffer.append(ln)
 
-        return all_data
-
-    def _split_samples(self, content):
-        """分割样本"""
-        # 查找分隔符
-        separators = []
-
-        # 查找 [数字] 格式的分隔符
-        bracket_matches = list(re.finditer(r'^\s*\[(\d+)\]\s*$', content, re.MULTILINE))
-
-        # 查找 ---- 格式的分隔符
-        dash_matches = list(re.finditer(r'^\s*----+\s*$', content, re.MULTILINE))
-
-        # 合并并排序
-        all_separators = []
-        for match in bracket_matches:
-            all_separators.append(('bracket', match.start(), match.end()))
-        for match in dash_matches:
-            all_separators.append(('dash', match.start(), match.end()))
-
-        all_separators.sort(key=lambda x: x[1])
-
-        if not all_separators:
-            return [content.strip()]
-
-        # 分割内容
-        samples = []
-        start_pos = 0
-
-        for sep_type, sep_start, sep_end in all_separators:
-            sample_content = content[start_pos:sep_start].strip()
-            if sample_content:
-                samples.append(sample_content)
-            start_pos = sep_end
-
-        # 添加最后的内容
-        last_content = content[start_pos:].strip()
-        if last_content:
-            samples.append(last_content)
+        # 尾部 flush
+        if current_header is not None and buffer:
+            samples.append((current_header, "\n".join(buffer)))
 
         return samples
 
-    def _save_and_analyze(self, all_data):
-        """保存和分析数据"""
-        # 转换为DataFrame
-        df = pd.DataFrame(all_data)
+class Processor:
+    def __init__(self):
+        self.extractor = Extractor()
+        self.splitter = SampleSplitter()
+        self.rows = []
 
-        # 保存主文件
-        output_file = self.output_dir / "llvm_data.csv"
-        df.to_csv(output_file, index=False)
-        print(f"数据已保存到: {output_file}")
+    def process_file(self, file_path):
+        try:
+            text = open(file_path, "r", encoding="utf-8", errors="ignore").read()
+        except:
+            return
 
-# 运行完整处理
-def run():
-    """运行完整的数据处理"""
-    processor = Processor()
-    data = processor.process_all_files()
-    return data
+        samples = self.splitter.split(text)
 
+        for idx, (header, ir) in enumerate(samples, 1):
+            sample_path = self.extractor.extract_path(header)
+            cwe = self.extractor.extract_cwe(header)
+            vuln_types = self.extractor.extract_vuln_types(header, ir)
 
-# 主函数
+            self.rows.append({
+                "sample_id": len(self.rows)+1,
+                "source_file": file_path,
+                "sample_path": sample_path,
+                "cwe_number": cwe,
+                "detailed_vuln_types": "|".join(vuln_types),
+                "ir_snippet": ir[:500].replace("\n", "\\n")
+            })
+
+    def process_directory(self, root, ext=".txt"):
+        for dirpath, _, files in os.walk(root):
+            for f in files:
+                if f.endswith(ext):
+                    self.process_file(os.path.join(dirpath, f))
+
+    def save_csv(self, out_csv):
+        keys = [
+            "sample_id", "source_file", "sample_path",
+            "cwe_number", "detailed_vuln_types", "ir_snippet"
+        ]
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=keys)
+            w.writeheader()
+            for r in self.rows:
+                w.writerow(r)
+
 if __name__ == "__main__":
-    print("\n" + "=" * 60 + "\n")
-    # 完整处理
-    print("开始处理所有数据文件...")
-    data = run()
-    if data:
-        print(f"\n✅ 成功处理 {len(data)} 个样本!")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input-dir", type=str)
+    parser.add_argument("--output", type=str, default="results.csv")
+    args = parser.parse_args()
 
+    P = Processor()
+    P.process_directory(args.input_dir)
+    P.save_csv(args.output)
+
+    print("处理完成，共生成样本：", len(P.rows))
